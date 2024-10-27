@@ -3,7 +3,7 @@
 ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/esp-rs/esp-idf-part/ci.yml?label=CI&logo=github&style=flat-square)
 [![Crates.io](https://img.shields.io/crates/v/esp-idf-part?color=C96329&logo=Rust&style=flat-square)](https://crates.io/crates/esp-idf-part)
 [![docs.rs](https://img.shields.io/docsrs/esp-idf-part?color=C96329&logo=rust&style=flat-square)](https://docs.rs/esp-idf-part)
-![MSRV](https://img.shields.io/badge/MSRV-1.71-blue?style=flat-square)
+![MSRV](https://img.shields.io/badge/MSRV-1.61-blue?style=flat-square)
 ![Crates.io](https://img.shields.io/crates/l/esp-idf-part?style=flat-square)
 
 A library for parsing and generating ESP-IDF partition tables. Supports parsing from and generating to both CSV and binary formats.
