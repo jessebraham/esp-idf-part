@@ -1,413 +1,331 @@
-//! A library for parsing and generating ESP-IDF partition tables, both in the
-//! binary and CSV formats as described in the ESP-IDF documentation.
+//! Follows the specification outlined by ESP-IDF v5.3.1, which at the time of
+//! writing is marked as the latest stable release.
 //!
-//! For additional information regarding the partition table format please refer
-//! to the ESP-IDF documentation:
-//! <https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/partition-tables.html>
+//! A single ESP32's flash can contain multiple apps, as well as many different
+//! kinds of data (calibration data, filesystems, parameter storage, etc.). For
+//! this reason a partition table is flashed to (default offset) 0x8000 in the
+//! flash.
 //!
-//! ## Features
-//!
-//! There is currently only a single feature, `std`; this feature is enabled by
-//! default.
-//!
-//! The following functionality is unavailable if the `std` feature is disabled:
-//!
-//! - (De)serializing a [PartitionTable] from/to CSV or binary format
-//! - Writing a [Partition] to a CSV or binary writer
+//! For more information, see the ESP-IDF documentation:
+//! <https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-guides/partition-tables.html>
 //!
 //! ## Examples
 //!
-//! ```rust,ignore
-//! // Read a partition table from a CSV file:
-//! let csv = std::fs::read_to_string("partitions.csv").unwrap();
-//! let table = PartitionTable::try_from_str(csv).unwrap();
-//!
-//! // Read a partition table from a binary file:
-//! let bin = std::fs::read("partitions.bin").unwrap();
-//! let table = PartitionTable::try_from_bytes(bin).unwrap();
-//!
-//! // Or, you can automatically determine which format is being passed:
-//! let table = PartitionTable::try_from(csv).unwrap();
-//! let table = PartitionTable::try_from(bin).unwrap();
-//!
-//! // You can find a partition by name, type, or subtype:
-//! let foo = table.find("factory").unwrap();
-//! let bar = table.find_by_type(Type::App).unwrap();
-//! let baz = table.find_by_type(Type::Data, DataType::Ota).unwrap();
+//! ```rust
+//! // TODO: Add an example :)
 //! ```
 
-#![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![doc(html_logo_url = "https://avatars.githubusercontent.com/u/46717278")]
+#![deny(missing_debug_implementations, missing_docs, rust_2018_idioms)]
+#![no_std]
 
-use core::ops::Rem as _;
-#[cfg(feature = "std")]
-use std::io::Write as _;
-
-#[cfg(feature = "std")]
-use deku::prelude::DekuContainerRead as _;
+use heapless::Vec;
+use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 
-pub use self::{
-    error::Error,
-    partition::{AppType, DataType, Partition, SubType, Type},
-};
-#[cfg(feature = "std")]
-use self::{
-    hash_writer::HashWriter,
-    partition::{DeserializedBinPartition, DeserializedCsvPartition},
-};
+const PARTITION_MAGIC_BYTES: [u8; 2] = [0xAA, 0x50];
+const MAX_NAME_LENGTH: usize = 16; // Includes null terminator
 
-mod error;
-mod partition;
+const MAX_ENTRIES: usize = 95;
+const PARTITION_SIZE: usize = 0x20; // 32B
+const PARTITION_TABLE_SIZE: usize = 0xC00; // 3kB
 
-#[cfg(not(feature = "std"))]
-type Vec<T> = heapless::Vec<T, PARTITION_SIZE>;
-
-pub(crate) const MD5_NUM_MAGIC_BYTES: usize = 16;
-#[cfg(feature = "std")]
+const MD5_NUM_MAGIC_BYTES: usize = 16;
 const MD5_PART_MAGIC_BYTES: [u8; MD5_NUM_MAGIC_BYTES] = [
     0xEB, 0xEB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 ];
-const PARTITION_SIZE: usize = 32;
 
-/// A partition table; a collection of partitions
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PartitionTable {
-    partitions: Vec<Partition>,
+/// TODO: Document me!
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Error {}
+
+/// Supported partition types
+///
+/// Partiton types can be specified as `app` (0x00) or `data` (0x01). Or, it can
+/// be a number from 0-254 (or as hex, 0x00-0xFE). Types 0x00-0x3F are reserved
+/// for ESP-IDF core functions.
+///
+/// If your app needs to store data in a format not already supported by
+/// ESP-IDF, then please add a custom partition type value in the range
+/// 0x40-0xFE.
+///
+/// The ESP-IDF bootloader ignores any partition types other than `app` (0x00)
+/// and `data` (0x01).
+///
+/// For more information, see the ESP-IDF documentation:
+/// <https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-guides/partition-tables.html#type-field>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Type {
+    /// App partition type
+    App,
+    /// Data partition type
+    Data,
+    /// Custom partition type
+    Custom(u8),
 }
 
-impl PartitionTable {
-    /// Construct a new partition table from zero or more partitions
-    ///
-    /// Note that in order for a partition table to pass validation, it must
-    /// have at least one partition with type [`Type::App`].
-    pub fn new(partitions: Vec<Partition>) -> Self {
-        Self { partitions }
-    }
-
-    /// Attempt to parse either a binary or CSV partition table from the given
-    /// input.
-    ///
-    /// For more information on the partition table format see:
-    /// <https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/partition-tables.html>
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    pub fn try_from<D>(data: D) -> Result<Self, Error>
-    where
-        D: Into<Vec<u8>>,
-    {
-        let input: Vec<u8> = data.into();
-
-        // If a partition table was detected from ESP-IDF (eg. using `esp-idf-sys`) then
-        // it will be passed in its _binary_ form. Otherwise, it will be provided as a
-        // CSV. A binary partition table starts with 0xAA 0x50 magic bytes.
-        if input[..2] == [0xAA, 0x50] {
-            Self::try_from_bytes(&*input)
-        } else {
-            Self::try_from_str(String::from_utf8(input)?)
+impl Type {
+    /// Value of the variant as a [u8]
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            Type::App => 0x00,
+            Type::Data => 0x01,
+            Type::Custom(value) => *value,
         }
-    }
-
-    /// Attempt to parse a binary partition table from the given bytes.
-    ///
-    /// For more information on the partition table format see:
-    /// <https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/partition-tables.html>
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    pub fn try_from_bytes<B>(bytes: B) -> Result<Self, Error>
-    where
-        B: Into<Vec<u8>>,
-    {
-        use md5::Digest;
-
-        const END_MARKER: [u8; 32] = [0xFF; 32];
-
-        let data = bytes.into();
-
-        // The data's MUST be an even multiple of 32
-        if data.len() % 32 != 0 {
-            return Err(Error::LengthNotMultipleOf32);
-        }
-
-        let mut ctx = md5::Md5::new();
-
-        let mut partitions = vec![];
-        for line in data.chunks_exact(PARTITION_SIZE) {
-            if line.starts_with(&MD5_PART_MAGIC_BYTES) {
-                // The first 16 bytes are just the marker. The next 16 bytes is
-                // the actual MD5 string.
-                let digest_in_file = &line[16..32];
-                let digest_computed = ctx.clone().finalize();
-
-                if digest_computed.as_slice() != digest_in_file {
-                    return Err(Error::InvalidChecksum {
-                        expected: digest_in_file.to_vec(),
-                        computed: digest_computed.to_vec(),
-                    });
-                }
-            } else if line != END_MARKER {
-                let (_, partition) = DeserializedBinPartition::from_bytes((line, 0))?;
-
-                let partition = Partition::from(partition);
-                partitions.push(partition);
-
-                ctx.update(line);
-            } else {
-                // We're finished parsing the binary data, time to construct and return the
-                // [PartitionTable].
-                let table = Self::new(partitions);
-                table.validate()?;
-
-                return Ok(table);
-            }
-        }
-
-        Err(Error::NoEndMarker)
-    }
-
-    /// Attempt to parse a CSV partition table from the given string.
-    ///
-    /// For more information on the partition table format see:
-    /// <https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/partition-tables.html>
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    pub fn try_from_str<S>(string: S) -> Result<Self, Error>
-    where
-        S: Into<String>,
-    {
-        let data = string.into();
-        let mut reader = csv::ReaderBuilder::new()
-            .comment(Some(b'#'))
-            .flexible(true)
-            .has_headers(false)
-            .trim(csv::Trim::All)
-            .from_reader(data.as_bytes());
-
-        // Default offset is 0x8000 in ESP-IDF, partition table size is 0x1000
-        let mut offset = 0x9000;
-
-        let mut partitions = vec![];
-        for record in reader.deserialize() {
-            // Since offsets are optional, we need to update the deserialized
-            // partition when this field is omitted
-            let mut partition: DeserializedCsvPartition = record?;
-            offset = partition.fix_offset(offset);
-
-            let partition = Partition::from(partition);
-            partitions.push(partition);
-        }
-
-        let table = Self::new(partitions);
-        table.validate()?;
-
-        Ok(table)
-    }
-
-    /// Return a reference to a vector containing each partition in the
-    /// partition table
-    pub fn partitions(&self) -> &Vec<Partition> {
-        &self.partitions
-    }
-
-    /// Find a partition with the given name in the partition table
-    pub fn find(&self, name: &str) -> Option<&Partition> {
-        self.partitions.iter().find(|p| p.name() == name)
-    }
-
-    /// Find a partition with the given type in the partition table
-    pub fn find_by_type(&self, ty: Type) -> Option<&Partition> {
-        self.partitions.iter().find(|p| p.ty() == ty)
-    }
-
-    /// Find a partition with the given type and subtype in the partition table
-    pub fn find_by_subtype(&self, ty: Type, subtype: SubType) -> Option<&Partition> {
-        self.partitions
-            .iter()
-            .find(|p| p.ty() == ty && p.subtype() == subtype)
-    }
-
-    /// Convert a partition table to binary
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    pub fn to_bin(&self) -> Result<Vec<u8>, Error> {
-        const MAX_PARTITION_LENGTH: usize = 0xC00;
-        const PARTITION_TABLE_SIZE: usize = 0x1000;
-
-        let mut result = Vec::with_capacity(PARTITION_TABLE_SIZE);
-        let mut hasher = HashWriter::new(&mut result);
-
-        for partition in &self.partitions {
-            partition.write_bin(&mut hasher)?;
-        }
-
-        let (writer, hash) = hasher.compute();
-
-        writer.write_all(&MD5_PART_MAGIC_BYTES)?;
-        writer.write_all(hash.as_slice())?;
-
-        let written = self.partitions.len() * PARTITION_SIZE + 32;
-        let padding = std::iter::repeat(0xFF)
-            .take(MAX_PARTITION_LENGTH - written)
-            .collect::<Vec<_>>();
-
-        writer.write_all(&padding)?;
-
-        Ok(result)
-    }
-
-    /// Convert a partition table to a CSV string
-    #[cfg(feature = "std")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
-    pub fn to_csv(&self) -> Result<String, Error> {
-        let mut csv = String::new();
-
-        // We will use the same common "header" that is used in ESP-IDF
-        csv.push_str("# ESP-IDF Partition Table\n");
-        csv.push_str("# Name,Type,SubType,Offset,Size,Flags\n");
-
-        // Serialize each partition using a [csv::Writer]
-        let mut writer = csv::WriterBuilder::new()
-            .has_headers(false)
-            .from_writer(vec![]);
-
-        for partition in &self.partitions {
-            partition.write_csv(&mut writer)?;
-        }
-
-        // Append the serialized partitions to the header text, leaving us with our
-        // completed CSV text
-        csv.push_str(&String::from_utf8_lossy(&writer.into_inner().unwrap()));
-
-        Ok(csv)
-    }
-
-    /// Validate a partition table
-    pub fn validate(&self) -> Result<(), Error> {
-        use self::partition::{APP_PARTITION_ALIGNMENT, DATA_PARTITION_ALIGNMENT};
-
-        const MAX_APP_PART_SIZE: u32 = 0x100_0000; // 16MB
-        const OTADATA_SIZE: u32 = 0x2000; // 8kB
-
-        // There must be at least one partition with type 'app'
-        if self.find_by_type(Type::App).is_none() {
-            return Err(Error::NoAppPartition);
-        }
-
-        // There can be at most one partition of type 'app' and of subtype 'factory'
-        if self
-            .partitions
-            .iter()
-            .filter(|p| p.ty() == Type::App && p.subtype() == SubType::App(AppType::Factory))
-            .count()
-            > 1
-        {
-            return Err(Error::MultipleFactoryPartitions);
-        }
-
-        // There can be at most one partition of type 'data' and of subtype 'otadata'
-        if self
-            .partitions
-            .iter()
-            .filter(|p| p.ty() == Type::Data && p.subtype() == SubType::Data(DataType::Ota))
-            .count()
-            > 1
-        {
-            return Err(Error::MultipleOtadataPartitions);
-        }
-
-        for partition in &self.partitions {
-            // Partitions of type 'app' have to be placed at offsets aligned to 0x10000
-            // (64k)
-            if partition.ty() == Type::App && partition.offset().rem(APP_PARTITION_ALIGNMENT) != 0 {
-                return Err(Error::UnalignedPartition);
-            }
-
-            // Partitions of type 'data' have to be placed at offsets aligned to 0x1000 (4k)
-            if partition.ty() == Type::Data && partition.offset().rem(DATA_PARTITION_ALIGNMENT) != 0
-            {
-                return Err(Error::UnalignedPartition);
-            }
-
-            // App partitions cannot exceed 16MB; see:
-            // https://github.com/espressif/esp-idf/blob/c212305/components/bootloader_support/src/esp_image_format.c#L158-L161
-            if partition.ty() == Type::App && partition.size() > MAX_APP_PART_SIZE {
-                return Err(Error::PartitionTooLarge(partition.name()));
-            }
-
-            if partition.ty() == Type::Data
-                && partition.subtype() == SubType::Data(DataType::Ota)
-                && partition.size() != OTADATA_SIZE
-            {
-                return Err(Error::InvalidOtadataPartitionSize);
-            }
-        }
-
-        for partition_a in &self.partitions {
-            for partition_b in &self.partitions {
-                // Do not compare partitions with themselves :)
-                if partition_a == partition_b {
-                    continue;
-                }
-
-                // Partitions cannot have conflicting names
-                if partition_a.name() == partition_b.name() {
-                    return Err(Error::DuplicatePartitions(partition_a.name()));
-                }
-
-                // Partitions cannot overlap each other
-                if partition_a.overlaps(partition_b) {
-                    return Err(Error::OverlappingPartitions(
-                        partition_a.name(),
-                        partition_b.name(),
-                    ));
-                }
-            }
-        }
-
-        Ok(())
     }
 }
 
-#[cfg(feature = "std")]
-mod hash_writer {
-    use md5::{
-        digest::{consts::U16, generic_array::GenericArray},
-        Digest,
-        Md5,
-    };
+/// Supported partition subtypes
+///
+/// The 8-bit subtype field is specific to a given partition type. ESP-IDF
+/// currently only specifies the meaning of the subtype field for `app` and
+/// `data` partition types.
+///
+/// For more information, see the ESP-IDF documentation:
+/// <https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-guides/partition-tables.html#subtype>
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum SubType {
+    /// App partition subtype
+    App(AppType),
+    /// Data partition subtype
+    Data(DataType),
+}
 
-    pub(crate) struct HashWriter<W> {
-        inner: W,
-        hasher: Md5,
+impl SubType {
+    /// Value of the variant as a [u8]
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            SubType::App(app_type) => app_type.as_u8(),
+            SubType::Data(data_type) => data_type.as_u8(),
+        }
     }
+}
 
-    impl<W> std::io::Write for HashWriter<W>
-    where
-        W: std::io::Write,
-    {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.hasher.update(buf);
-            self.inner.write(buf)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            self.inner.flush()
-        }
+impl From<AppType> for SubType {
+    fn from(value: AppType) -> Self {
+        Self::App(value)
     }
+}
 
-    impl<W> HashWriter<W>
-    where
-        W: std::io::Write,
-    {
-        pub fn new(inner: W) -> Self {
-            Self {
-                inner,
-                hasher: Md5::new(),
-            }
-        }
+impl From<DataType> for SubType {
+    fn from(value: DataType) -> Self {
+        Self::Data(value)
+    }
+}
 
-        pub fn compute(self) -> (W, GenericArray<u8, U16>) {
-            (self.inner, self.hasher.finalize())
-        }
+/// Supported app partition subtypes
+///
+/// `factory` (0x00) is the default app partition. The bootloader will execute
+/// the factory app unless there it sees a partition of type data/ota, in which
+/// case it reads this partition to determine which OTA image to boot.
+///
+/// - OTA never updates the factory partition.
+/// - If you want to conserve flash usage in an OTA project, you can remove the
+///   factory partition and use `ota_0` instead.
+///
+/// `ota_0` (0x10) ... `ota_15` (0x1F) are the OTA app slots. When [OTA] is in
+/// use, the OTA data partition configures which app slot the bootloader should
+/// boot. When using OTA, an application should have at least two OTA
+/// application slots (`ota_0` & `ota_1`). Refer to the [OTA documentation] for
+/// more details.
+///
+/// `test` (0x20) is a reserved subtype for factory test procedures. It will be
+/// used as the fallback boot partition if no other valid app partition is
+/// found. It is also possible to configure the bootloader to read a GPIO input
+/// during each boot, and boot this partition if the GPIO is held low, see [Boot
+/// from Test Firmware].
+///
+/// For more information, see the ESP-IDF documentation:
+/// <https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-guides/partition-tables.html#subtype>
+///
+/// [OTA]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-reference/system/ota.html
+/// [OTA documentation]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-reference/system/ota.html
+/// [Boot from Test Firmware]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-guides/bootloader.html#bootloader-boot-from-test-firmware
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AppType {
+    /// Factory app partition type
+    Factory = 0x00,
+    /// `ota_0` app partition type
+    Ota0    = 0x10,
+    /// `ota_1` app partition type
+    Ota1    = 0x11,
+    /// `ota_2` app partition type
+    Ota2    = 0x12,
+    /// `ota_3` app partition type
+    Ota3    = 0x13,
+    /// `ota_4` app partition type
+    Ota4    = 0x14,
+    /// `ota_5` app partition type
+    Ota5    = 0x15,
+    /// `ota_6` app partition type
+    Ota6    = 0x16,
+    /// `ota_7` app partition type
+    Ota7    = 0x17,
+    /// `ota_8` app partition type
+    Ota8    = 0x18,
+    /// `ota_9` app partition type
+    Ota9    = 0x19,
+    /// `ota_10` app partition type
+    Ota10   = 0x1A,
+    /// `ota_11` app partition type
+    Ota11   = 0x1B,
+    /// `ota_12` app partition type
+    Ota12   = 0x1C,
+    /// `ota_13` app partition type
+    Ota13   = 0x1D,
+    /// `ota_14` app partition type
+    Ota14   = 0x1E,
+    /// `ota_15` app partition type
+    Ota15   = 0x1F,
+    /// Test app partition type
+    Test    = 0x20,
+}
+
+impl AppType {
+    /// Value of the variant as a [u8]
+    pub fn as_u8(&self) -> u8 {
+        *self as u8
+    }
+}
+
+/// Supported data partition subtypes
+///
+/// When type is `data`, the subtype field can be specified as `ota` (0x00),
+/// `phy` (0x01), `nvs` (0x02), `nvs_keys` (0x04), or a range of other
+/// component-specific subtypes.
+///
+/// `ota` (0x00) is the [OTA data partition] which stores information about the
+/// currently selected OTA app slot. This partition should be 0x2000 bytes in
+/// size. Refer to the [OTA documentation] for more details.
+///
+/// `phy` (0x01) is for storing PHY initialisation data. This allows PHY to be
+/// configured per-device, instead of in firmware.
+///
+/// - In the default configuration, the phy partition is not used and PHY
+///   initialisation data is compiled into the app itself. As such, this
+///   partition can be removed from the partition table to save space.
+/// - To load PHY data from this partition, open the project configuration menu
+///   (`idf.py menuconfig`) and enable `CONFIG_ESP_PHY_INIT_DATA_IN_PARTITION`
+///   option. You will also need to flash your devices with phy init data as the
+///   esp-idf build system does not do this automatically.
+///
+/// `nvs` (0x02) is for the [Non-Volatile Storage (NVS) API].
+///
+/// - NVS is used to store per-device PHY calibration data (different to
+///   initialisation data).
+/// - NVS is used to store Wi-Fi data if the `esp_wifi_set_storage`
+///   initialization function is used.
+/// - The NVS API can also be used for other application data.
+/// - It is strongly recommended that you include an NVS partition of at least
+///   0x3000 bytes in your project.
+/// - If using NVS API to store a lot of data, increase the NVS partition size
+///   from the default 0x6000 bytes.
+///
+/// `nvs_keys` (0x04) is for the NVS key partition. See [Non-Volatile Storage
+/// (NVS) API] for more details.
+///
+/// - It is used to store NVS encryption keys when NVS Encryption feature is
+///   enabled.
+/// - The size of this partition should be 4096 bytes (minimum partition size).
+///
+/// There are other predefined data subtypes for data storage supported by
+/// ESP-IDF. These include:
+///
+/// - `coredump` (0x03) is for storing core dumps while using a custom partition
+///   table CSV file. See [Core Dump] for more details.
+/// - `efuse` (0x05) is for emulating eFuse bits using [Virtual eFuses].
+/// - `undefined` (0x06) is implicitly used for data partitions with unspecified
+///   (empty) subtype, but it is possible to explicitly mark them as undefined
+///   as well.
+/// - `fat` (0x81) is for [FAT Filesystem Support].
+/// - `spiffs` (0x82) is for [SPIFFS Filesystem].
+/// - `littlefs` (0x83) is for [LittleFS filesystem].
+///
+/// If the partition type is any application-defined value (range 0x40-0xFE),
+/// then `subtype` field can be any value chosen by the application (range
+/// 0x00-0xFE).
+///
+/// For more information, see the ESP-IDF documentation:
+/// <https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-guides/partition-tables.html#subtype>
+///
+/// [OTA data partition]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-reference/system/ota.html#ota-data-partition
+/// [OTA documentation]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-reference/system/ota.html#ota-data-partition
+/// [Non-Volatile Storage (NVS) API]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-reference/storage/nvs_flash.html
+/// [Core Dump]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-guides/core_dump.html
+/// [Virtual eFuses]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-reference/system/efuse.html#virtual-efuses
+/// [Fat Filesystem Support]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-reference/storage/fatfs.html
+/// [SPIFFS Filesystem]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-reference/storage/spiffs.html
+/// [LittleFS filesystem]: https://github.com/littlefs-project/littlefs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum DataType {
+    /// OTA data partition which stores information about the currently selected
+    /// OTA app slot
+    Ota       = 0x00,
+    /// PHY initialisation data
+    Phy       = 0x01,
+    /// Used for the [Non-Volatile Storage (NVS) API]
+    ///
+    /// [Non-Volatile Storage (NVS) API]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-reference/storage/nvs_flash.html
+    Nvs       = 0x02,
+    /// For storing core dumps while using a custom partition table CSV file
+    Coredump  = 0x03,
+    /// NVS key partition
+    ///
+    /// See [Non-Volatile Storage (NVS) API] for more details.
+    ///
+    /// [Non-Volatile Storage (NVS) API]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-reference/storage/nvs_flash.html
+    NvsKeys   = 0x04,
+    /// Used for emulating eFuse bits using Virtual eFuses
+    EfuseEm   = 0x05,
+    /// Implicitly used for data partitions with unspecified (empty) subtype
+    Undefined = 0x06,
+    /// TODO: Document me!
+    EspHttpd  = 0x80,
+    /// FAT filesystem support
+    Fat       = 0x81,
+    /// SPIFFS filesystem support
+    Spiffs    = 0x82,
+    /// LittleFS filesystem support
+    LittleFs  = 0x83,
+}
+
+impl DataType {
+    /// Value of the variant as a [u8]
+    pub fn as_u8(&self) -> u8 {
+        *self as u8
+    }
+}
+
+bitflags::bitflags! {
+    /// Supported partition flags
+    ///
+    /// Two flags are currently supported, `encrypted` and `readonly`:
+    ///
+    /// - If `encrypted` flag is set, the partition will be encrypted if [Flash
+    ///   Encryption] is enabled.
+    ///     - Note: `app` type partitions will always be encrypted, regardless of
+    ///       whether this flag is set or not.
+    /// - If `readonly` flag is set, the partition will be read-only. This flag is
+    ///   only supported for `data` type partitions except `ota` and `coredump`
+    ///   subtypes. This flag can help to protect against accidental writes to a
+    ///   partition that contains critical device-specific configuration data, e.g.
+    ///   factory data partition.
+    ///
+    /// You can specify multiple flags by separating them with a colon. For example,
+    /// `encrypted:readonly`.
+    ///
+    /// For more information, see the ESP-IDF documentation:
+    /// <https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-guides/partition-tables.html#flags>
+    ///
+    /// [Flash Encryption]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/security/flash-encryption.html
+    pub struct Flags: u32 {
+        /// Encrypted partition
+        const ENCRYPTED = 0b0001;
+        /// Read-only partition
+        const READONLY  = 0b0010;
     }
 }
