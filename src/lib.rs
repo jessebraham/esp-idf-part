@@ -19,9 +19,13 @@
 #![deny(missing_debug_implementations, missing_docs, rust_2018_idioms)]
 #![no_std]
 
+use core::{
+    cmp::{max, min},
+    ops::Rem,
+    str::FromStr,
+};
+
 use heapless::Vec;
-use md5::{Digest, Md5};
-use serde::{Deserialize, Serialize};
 
 const PARTITION_MAGIC_BYTES: [u8; 2] = [0xAA, 0x50];
 const MAX_NAME_LENGTH: usize = 16; // Includes null terminator
@@ -35,9 +39,19 @@ const MD5_PART_MAGIC_BYTES: [u8; MD5_NUM_MAGIC_BYTES] = [
     0xEB, 0xEB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
 ];
 
-/// TODO: Document me!
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+type NameString = heapless::String<MAX_NAME_LENGTH>;
+
+/// Errors encountered during creation or validation of a [PartitionTable]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Error {}
+
+impl core::error::Error for Error {}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        todo!()
+    }
+}
 
 /// Supported partition types
 ///
@@ -322,10 +336,135 @@ bitflags::bitflags! {
     /// <https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/api-guides/partition-tables.html#flags>
     ///
     /// [Flash Encryption]: https://docs.espressif.com/projects/esp-idf/en/v5.3.1/esp32/security/flash-encryption.html
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct Flags: u32 {
         /// Encrypted partition
         const ENCRYPTED = 0b0001;
         /// Read-only partition
         const READONLY  = 0b0010;
+    }
+}
+
+/// A partition
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct Partition {
+    magic: [u8; 2],
+    type_: Type,
+    subtype: SubType,
+    offset: u32,
+    size: u32,
+    name: NameString,
+    flags: Flags,
+}
+
+impl Partition {
+    /// Construct a new instance of [Partition]
+    pub fn new(
+        name: &str,
+        type_: Type,
+        subtype: SubType,
+        offset: u32,
+        size: u32,
+        flags: Flags,
+    ) -> Self {
+        // The name of the partition can be at most `MAX_NAME_LENGTH` bytes in length,
+        // *including* the null terminator. Names longer than this are truncated.
+        let length = min(name.len(), MAX_NAME_LENGTH - 1);
+        let name = NameString::from_str(&name[..length]).unwrap();
+
+        Self {
+            magic: PARTITION_MAGIC_BYTES,
+            type_,
+            subtype,
+            offset,
+            size,
+            name,
+            flags,
+        }
+    }
+
+    /// Name of the partition
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    /// [Type] of the partition
+    pub fn type_(&self) -> Type {
+        self.type_
+    }
+
+    /// [SubType] of the partition
+    pub fn subtype(&self) -> SubType {
+        self.subtype
+    }
+
+    /// Offest of the partition
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+
+    /// Size of the partition
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// Flags of the partition
+    pub fn flags(&self) -> Flags {
+        self.flags
+    }
+}
+
+impl PartialOrd for Partition {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        self.offset.partial_cmp(&other.offset)
+    }
+}
+
+/// A partition table
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct PartitionTable {
+    partitions: Vec<Partition, MAX_ENTRIES>,
+}
+
+impl PartitionTable {
+    /// Construct a new instance of [PartitionTable]
+    pub fn new(partitions: Vec<Partition, MAX_ENTRIES>) -> Self {
+        Self { partitions }
+    }
+
+    /// Returns a slice of [Partition]
+    pub fn partitions(&self) -> &[Partition] {
+        &self.partitions
+    }
+
+    /// Find a partition with the given name
+    ///
+    /// This function is short-circuiting; it will return the first partition
+    /// found, if one exists.
+    pub fn find(&self, name: &str) -> Option<&Partition> {
+        self.partitions.iter().find(|p| p.name() == name)
+    }
+
+    /// Find a partition with the given [Type]
+    ///
+    /// This function is short-circuiting; it will return the first partition
+    /// found, if one exists.
+    pub fn find_type(&self, type_: Type) -> Option<&Partition> {
+        self.partitions.iter().find(|p| p.type_() == type_)
+    }
+
+    /// Find a partition with the given [SubType]
+    ///
+    /// This function is short-circuiting; it will return the first partition
+    /// found, if one exists.
+    pub fn find_subtype(&self, subtype: SubType) -> Option<&Partition> {
+        self.partitions.iter().find(|p| p.subtype() == subtype)
+    }
+
+    /// Validate a partition table
+    pub fn validate(&self) -> Result<(), Error> {
+        todo!()
     }
 }
