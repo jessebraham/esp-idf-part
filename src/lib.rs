@@ -26,6 +26,7 @@ use core::{
 };
 
 use heapless::Vec;
+use md5::{Digest, Md5};
 
 const PARTITION_MAGIC_BYTES: [u8; 2] = [0xAA, 0x50];
 const MAX_NAME_LENGTH: usize = 16; // Includes null terminator
@@ -43,7 +44,10 @@ type NameString = heapless::String<MAX_NAME_LENGTH>;
 
 /// Errors encountered during creation or validation of a [PartitionTable]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Error {}
+pub enum Error {
+    /// Number of provided partitions exceeds the maximum allowable value
+    TooManyPartitions(usize),
+}
 
 impl core::error::Error for Error {}
 
@@ -413,6 +417,26 @@ impl Partition {
     pub fn flags(&self) -> Flags {
         self.flags
     }
+
+    /// Convert a partition into an array of bytes
+    pub fn as_bytes(&self) -> [u8; PARTITION_SIZE] {
+        let mut name = [b'\0'; MAX_NAME_LENGTH];
+        for (i, byte) in self.name.as_bytes().iter().enumerate() {
+            name[i] = *byte;
+        }
+
+        let mut bytes = Vec::<u8, PARTITION_SIZE>::new();
+        bytes.extend(self.magic);
+        bytes.extend([self.type_.as_u8()]);
+        bytes.extend([self.subtype.as_u8()]);
+        bytes.extend(self.offset.to_le_bytes());
+        bytes.extend(self.size.to_le_bytes());
+        bytes.extend(name);
+        bytes.extend(self.flags.bits().to_le_bytes());
+
+        // SAFETY: We know that `bytes` is the correct length, so this will not panic
+        bytes.into_array().unwrap()
+    }
 }
 
 impl PartialOrd for Partition {
@@ -430,8 +454,11 @@ pub struct PartitionTable {
 
 impl PartitionTable {
     /// Construct a new instance of [PartitionTable]
-    pub fn new(partitions: Vec<Partition, MAX_ENTRIES>) -> Self {
-        Self { partitions }
+    pub fn new(partitions: &[Partition]) -> Result<Self, Error> {
+        let partitions =
+            Vec::from_slice(partitions).map_err(|_| Error::TooManyPartitions(partitions.len()))?;
+
+        Ok(Self { partitions })
     }
 
     /// Returns a slice of [Partition]
@@ -466,5 +493,26 @@ impl PartitionTable {
     /// Validate a partition table
     pub fn validate(&self) -> Result<(), Error> {
         todo!()
+    }
+
+    /// Convert a partition table into an array of bytes
+    pub fn as_bytes(&self) -> [u8; PARTITION_TABLE_SIZE] {
+        let mut bytes = Vec::<u8, PARTITION_TABLE_SIZE>::new();
+        let mut hasher = Md5::new();
+
+        for partition in &self.partitions {
+            let partition_bytes = partition.as_bytes();
+            bytes.extend(partition_bytes);
+            hasher.update(partition_bytes);
+        }
+
+        bytes.extend(MD5_PART_MAGIC_BYTES);
+        bytes.extend(hasher.finalize());
+
+        let padding = core::iter::repeat(0xFF).take(PARTITION_TABLE_SIZE - bytes.len());
+        bytes.extend(padding);
+
+        // SAFETY: We know that `bytes` is the correct length, so this will not panic
+        bytes.into_array().unwrap()
     }
 }
